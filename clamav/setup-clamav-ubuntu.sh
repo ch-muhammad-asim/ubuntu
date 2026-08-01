@@ -5,6 +5,7 @@ SCRIPT_NAME="$(basename "$0")"
 TARGET_USER=""
 ENABLE_ON_ACCESS=1
 ENABLE_UNATTENDED_UPGRADES=1
+MAX_THREADS=0
 SCAN_PATH_ARGS=()
 
 log() {
@@ -27,6 +28,7 @@ Usage: sudo bash ${SCRIPT_NAME} [options]
 Options:
   --user USER                  Desktop user to protect. Defaults to SUDO_USER when available.
   --scan-path PATH             Add a scan/watch path. Can be provided more than once.
+  --max-threads THREADS        clamd worker threads. Defaults to a desktop-friendly automatic value.
   --skip-on-access             Install ClamAV without enabling clamonacc on-access scanning.
   --no-unattended-upgrades     Do not install or configure unattended-upgrades.
   -h, --help                   Show this help.
@@ -48,6 +50,13 @@ while [[ $# -gt 0 ]]; do
     --scan-path)
       [[ $# -ge 2 ]] || die "--scan-path requires a value"
       SCAN_PATH_ARGS+=("$2")
+      shift 2
+      ;;
+    --max-threads)
+      [[ $# -ge 2 ]] || die "--max-threads requires a value"
+      [[ "$2" =~ ^[1-9][0-9]*$ ]] || die "--max-threads must be a positive integer"
+      MAX_THREADS="$2"
+      (( MAX_THREADS <= 48 )) || die "--max-threads must not exceed 48"
       shift 2
       ;;
     --skip-on-access)
@@ -78,6 +87,22 @@ done
 command -v apt-get >/dev/null 2>&1 || die "apt-get is required"
 command -v systemctl >/dev/null 2>&1 || die "systemd/systemctl is required"
 [[ -d /run/systemd/system ]] || die "systemd is not running; this installer requires a systemd-based Ubuntu host"
+
+if [[ "${MAX_THREADS}" -eq 0 ]]; then
+  if command -v nproc >/dev/null 2>&1; then
+    MAX_THREADS="$(nproc)"
+  else
+    MAX_THREADS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || true)"
+  fi
+  [[ "${MAX_THREADS}" =~ ^[1-9][0-9]*$ ]] || MAX_THREADS=1
+  (( MAX_THREADS <= 2 )) || MAX_THREADS=$((MAX_THREADS - 1))
+  (( MAX_THREADS <= 8 )) || MAX_THREADS=8
+fi
+
+MAX_QUEUE=$((MAX_THREADS * 2))
+(( MAX_QUEUE >= 100 )) || MAX_QUEUE=100
+ONACCESS_MAX_THREADS=$(((MAX_THREADS + 1) / 2))
+(( ONACCESS_MAX_THREADS <= 4 )) || ONACCESS_MAX_THREADS=4
 
 if [[ -z "${TARGET_USER}" && -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
   TARGET_USER="${SUDO_USER}"
@@ -116,9 +141,14 @@ else
 fi
 
 declare -a ACTIVE_SCAN_PATHS=()
+declare -A SEEN_SCAN_PATHS=()
 for path in "${CANDIDATE_SCAN_PATHS[@]}"; do
   if [[ -d "${path}" ]]; then
-    ACTIVE_SCAN_PATHS+=("$(readlink -f "${path}")")
+    canonical_path="$(readlink -f "${path}")"
+    if [[ -z "${SEEN_SCAN_PATHS["${canonical_path}"]+set}" ]]; then
+      ACTIVE_SCAN_PATHS+=("${canonical_path}")
+      SEEN_SCAN_PATHS["${canonical_path}"]=1
+    fi
   else
     warn "Skipping missing scan path: ${path}"
   fi
@@ -143,7 +173,6 @@ write_daily_scan_script() {
 #!/usr/bin/env bash
 set -uo pipefail
 
-BATCH_SIZE=200
 LOG_FILE="/var/log/clamav/daily-scan.log"
 START_STAMP="$(date '+%Y-%m-%d %H:%M:%S')"
 ACTIVE_SCAN_PATHS=(
@@ -158,20 +187,23 @@ SCAN_HEAD
 
 mkdir -p "$(dirname "${LOG_FILE}")"
 
-if [[ "${#ACTIVE_SCAN_PATHS[@]}" -eq 0 ]]; then
-  END_STAMP="$(date '+%Y-%m-%d %H:%M:%S')"
-  echo "[${END_STAMP}] Scan aborted: no valid scan paths were configured" >> "${LOG_FILE}"
-  exit 2
-fi
-
+declare -a RUN_SCAN_PATHS=()
 for path in "${ACTIVE_SCAN_PATHS[@]}"; do
-  if [[ ! -d "${path}" ]]; then
+  if [[ -d "${path}" ]]; then
+    RUN_SCAN_PATHS+=("${path}")
+  else
     END_STAMP="$(date '+%Y-%m-%d %H:%M:%S')"
     echo "[${END_STAMP}] Scan warning: configured path no longer exists: ${path}" >> "${LOG_FILE}"
   fi
 done
 
-echo "[${START_STAMP}] Starting ClamAV daily scan for: ${ACTIVE_SCAN_PATHS[*]}" >> "${LOG_FILE}"
+if [[ "${#RUN_SCAN_PATHS[@]}" -eq 0 ]]; then
+  END_STAMP="$(date '+%Y-%m-%d %H:%M:%S')"
+  echo "[${END_STAMP}] Scan aborted: no valid scan paths were configured" >> "${LOG_FILE}"
+  exit 2
+fi
+
+echo "[${START_STAMP}] Starting parallel ClamAV daily scan for: ${RUN_SCAN_PATHS[*]}" >> "${LOG_FILE}"
 
 if ! systemctl is-active --quiet clamav-daemon.service; then
   END_STAMP="$(date '+%Y-%m-%d %H:%M:%S')"
@@ -179,64 +211,13 @@ if ! systemctl is-active --quiet clamav-daemon.service; then
   exit 2
 fi
 
-STATUS=0
-FILES_SCANNED=0
-declare -a BATCH=()
-
-scan_batch() {
-  local batch_status=0
-
-  if [[ "${#BATCH[@]}" -eq 0 ]]; then
-    return 0
-  fi
-
-  FILES_SCANNED=$((FILES_SCANNED + ${#BATCH[@]}))
-
-  if /usr/bin/clamdscan --fdpass --infected --log="${LOG_FILE}" "${BATCH[@]}"; then
-    batch_status=0
-  else
-    batch_status=$?
-  fi
-
-  BATCH=()
-  return "${batch_status}"
-}
-
-while IFS= read -r -d '' file_path; do
-  BATCH+=("${file_path}")
-
-  if [[ "${#BATCH[@]}" -ge "${BATCH_SIZE}" ]]; then
-    if scan_batch; then
-      :
-    else
-      batch_status=$?
-      if [[ "${batch_status}" -eq 1 ]]; then
-        STATUS=1
-      else
-        STATUS="${batch_status}"
-        break
-      fi
-    fi
-  fi
-done < <(
-  find "${ACTIVE_SCAN_PATHS[@]}" -xdev -type f -readable -print0 2>>"${LOG_FILE}"
-)
-
-if [[ "${STATUS}" -eq 0 || "${STATUS}" -eq 1 ]]; then
-  if scan_batch; then
-    :
-  else
-    batch_status=$?
-    if [[ "${batch_status}" -eq 1 ]]; then
-      STATUS=1
-    else
-      STATUS="${batch_status}"
-    fi
-  fi
+if /usr/bin/clamdscan --multiscan --fdpass --infected --log="${LOG_FILE}" "${RUN_SCAN_PATHS[@]}"; then
+  STATUS=0
+else
+  STATUS=$?
 fi
 
 END_STAMP="$(date '+%Y-%m-%d %H:%M:%S')"
-echo "[${END_STAMP}] Files submitted to clamdscan: ${FILES_SCANNED}" >> "${LOG_FILE}"
 
 if [[ "${STATUS}" -eq 0 ]]; then
   echo "[${END_STAMP}] Scan completed: no threats found" >> "${LOG_FILE}"
@@ -293,7 +274,7 @@ mkdir -p /var/lib/clamav/quarantine
 mkdir -p /var/log/clamav
 
 backup_if_changed /etc/clamav/clamd.conf
-cat >/etc/clamav/clamd.conf <<'CLAMD'
+cat >/etc/clamav/clamd.conf <<CLAMD
 # Managed by setup-clamav-ubuntu.sh
 LocalSocket /var/run/clamav/clamd.ctl
 FixStaleSocket true
@@ -307,7 +288,7 @@ MaxDirectoryRecursion 15
 FollowDirectorySymlinks false
 FollowFileSymlinks false
 ReadTimeout 180
-MaxThreads 12
+MaxThreads ${MAX_THREADS}
 MaxConnectionQueueLength 15
 LogSyslog false
 LogRotate true
@@ -334,7 +315,7 @@ LeaveTemporaryFiles false
 AlgorithmicDetection true
 ScanELF true
 IdleTimeout 30
-CrossFilesystems true
+CrossFilesystems false
 PhishingSignatures true
 PhishingScanURLs true
 PhishingAlwaysBlockSSLMismatch false
@@ -346,7 +327,7 @@ HeuristicScanPrecedence false
 StructuredDataDetection false
 CommandReadTimeout 30
 SendBufTimeout 200
-MaxQueue 100
+MaxQueue ${MAX_QUEUE}
 ExtendedDetectionInfo true
 OLE2BlockMacros false
 AllowAllMatchScan true
@@ -375,6 +356,7 @@ Bytecode true
 BytecodeSecurity TrustSigned
 BytecodeTimeout 60000
 OnAccessMaxFileSize 25M
+OnAccessMaxThreads ${ONACCESS_MAX_THREADS}
 OnAccessExcludeUname clamav
 CLAMD
 
@@ -442,11 +424,11 @@ if ! wait_for_databases; then
   warn "ClamAV databases were not ready after waiting. clamav-daemon may start after freshclam completes."
 fi
 
-systemctl enable --now clamav-daemon.service
+systemctl enable clamav-daemon.service
 systemctl restart clamav-daemon.service
 
 if [[ "${ENABLE_ON_ACCESS}" -eq 1 && "${#ACTIVE_SCAN_PATHS[@]}" -gt 0 ]]; then
-  systemctl enable --now clamav-clamonacc.service
+  systemctl enable clamav-clamonacc.service
   systemctl restart clamav-clamonacc.service
 else
   systemctl disable --now clamav-clamonacc.service >/dev/null 2>&1 || true
@@ -476,6 +458,7 @@ fi
 
 echo
 echo "ClamAV setup complete"
+echo "clamd workers: ${MAX_THREADS} (queue: ${MAX_QUEUE}; on-access workers: ${ONACCESS_MAX_THREADS})"
 if [[ -n "${TARGET_USER}" ]]; then
   echo "Protected user: ${TARGET_USER}"
   echo "Note: ${TARGET_USER} was added to the clamav group. Log out and back in before running clamdscan without sudo."

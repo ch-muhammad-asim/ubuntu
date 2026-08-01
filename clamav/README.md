@@ -57,6 +57,12 @@ Custom scan/watch paths:
 sudo bash clamav/setup-clamav-ubuntu.sh --scan-path /srv/uploads --scan-path /home/alice/Downloads
 ```
 
+Override the desktop-friendly automatic worker count on a high-performance workstation:
+
+```bash
+sudo bash clamav/setup-clamav-ubuntu.sh --max-threads 24
+```
+
 Headless or scan-only install without on-access scanning:
 
 ```bash
@@ -84,6 +90,7 @@ The installer:
 - optionally installs and enables `unattended-upgrades`
 - detects the protected desktop user from `SUDO_USER`, or accepts `--user`
 - accepts repeated `--scan-path` values for servers or custom workloads
+- sizes the `clamd` worker pool for desktop responsiveness by reserving one logical CPU and capping the automatic value at 8 workers, with `--max-threads` available for explicit tuning
 - defaults headless scheduled scans to `/home` while leaving on-access scanning disabled unless paths are explicit
 - backs up an existing `/etc/clamav/clamd.conf` before replacing it
 - configures a group-restricted daemon socket with `LocalSocketMode 660`
@@ -93,6 +100,8 @@ The installer:
 - creates `/usr/local/bin/clamav-daily-scan`
 - creates `clamav-daily-scan.service` and `clamav-daily-scan.timer`
 - validates `clamscan`, `clamdscan`, active services, and a daemon scan of `/etc/hosts`
+
+The installer intentionally resolves the protected user's home directory through `getent passwd` instead of `$HOME`. Under `sudo`, `$HOME` may be `/root`; using it would silently configure the wrong scan paths. All resolved paths are quoted, so home directories and custom paths containing spaces remain safe.
 
 ## Paths
 
@@ -200,7 +209,7 @@ systemctl status clamav-daily-scan.service --no-pager
 tail -n 80 /var/log/clamav/daily-scan.log
 ```
 
-The daily scan script uses `find` to collect readable regular files and sends them to `clamdscan` in batches. It uses `-xdev` to avoid crossing filesystem boundaries unexpectedly.
+The daily scan submits configured directories once with `clamdscan --multiscan --fdpass`. This lets `clamdscan` keep the daemon's worker pool busy while retaining descriptor-based access to protected user files, avoiding a process and socket round trip for every small batch. `CrossFilesystems false` keeps recursive scans on the configured filesystems.
 
 ## On-Access Scanning
 
@@ -272,3 +281,14 @@ sudo rm -f /var/lib/clamav/quarantine/eicar.com.txt
 - If `clamonacc` uses too many resources, reduce paths in `/etc/clamav/onaccess.watch`.
 - If a development tree is large, prefer scheduled scans over on-access monitoring for that tree.
 - If logs are unreadable as a normal user, use `sudo`; ClamAV logs are commonly protected.
+
+## Development Checks
+
+Run the portable regression suite before publishing installer changes:
+
+```bash
+bash clamav/tests/test-installer.sh
+shellcheck clamav/setup-clamav-ubuntu.sh clamav/tests/test-installer.sh
+```
+
+When ClamAV is installed locally, the suite also validates the generated `clamd.conf` with the packaged ClamAV parser.
