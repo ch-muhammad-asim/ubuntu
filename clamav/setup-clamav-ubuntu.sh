@@ -14,6 +14,8 @@ WATCH_TMP=1
 VERIFY_ONLY=0
 RUN_FULL_SCAN=1
 MAX_THREADS=0
+EXCLUDE_DEV_CACHES=0
+LOW_MEMORY=0
 SCAN_PATH_ARGS=()
 WATCH_PATH_ARGS=()
 REPORT_FILE=""
@@ -37,7 +39,11 @@ Options:
   --no-tmp-watch               Do not watch /tmp on access.
   --prevention                 Block access to files until scanned (OnAccessPrevention, global for all
                                watched paths). Off by default: it slows every open in watched folders.
-  --max-threads THREADS        clamd worker threads. Defaults to a desktop-friendly automatic value.
+  --max-threads THREADS        clamd worker threads. Default: half the CPUs rounded down, at least 1, at most 4.
+  --exclude-dev-caches         Also exclude disposable download caches in each user's home from the daily scan
+                               (~/.cache, npm _cacache, cargo registry/cache, Go module download cache).
+  --low-memory                 ConcurrentDatabaseReload no: reload signatures in place (about half the peak
+                               memory); scans wait while a reload runs. Default keeps concurrent reload.
   --skip-on-access             Install ClamAV without enabling clamonacc on-access scanning.
   --no-unattended-upgrades     Do not install or configure unattended-upgrades.
   --skip-full-scan             Do not run the real daily scan at the end (verification stays short).
@@ -77,6 +83,8 @@ while [[ $# -gt 0 ]]; do
       [[ $# -ge 2 ]] || die "--report requires a value"
       REPORT_FILE="$2"; shift 2 ;;
     --no-tmp-watch) WATCH_TMP=0; shift ;;
+    --exclude-dev-caches) EXCLUDE_DEV_CACHES=1; shift ;;
+    --low-memory) LOW_MEMORY=1; shift ;;
     --prevention) ENABLE_PREVENTION=1; shift ;;
     --skip-on-access) ENABLE_ON_ACCESS=0; shift ;;
     --no-unattended-upgrades) ENABLE_UNATTENDED_UPGRADES=0; shift ;;
@@ -98,12 +106,44 @@ command -v apt-get >/dev/null 2>&1 || die "apt-get is required"
 command -v systemctl >/dev/null 2>&1 || die "systemd/systemctl is required"
 [[ -d /run/systemd/system ]] || die "systemd is not running; this installer requires a systemd-based Ubuntu host"
 
-if [[ "${MAX_THREADS}" -eq 0 ]]; then
-  MAX_THREADS="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || true)"
-  [[ "${MAX_THREADS}" =~ ^[1-9][0-9]*$ ]] || MAX_THREADS=1
-  (( MAX_THREADS <= 2 )) || MAX_THREADS=$((MAX_THREADS - 1))
-  (( MAX_THREADS <= 8 )) || MAX_THREADS=8
-fi
+default_max_threads() {  # default_max_threads CPUS: half the CPUs rounded down, at least 1, at most 4
+  local cpus="$1" threads
+  [[ "${cpus}" =~ ^[1-9][0-9]*$ ]] || cpus=1
+  threads=$((cpus / 2))
+  (( threads >= 1 )) || threads=1
+  (( threads <= 4 )) || threads=4
+  printf '%s\n' "${threads}"
+}
+
+regex_escape() {  # regex_escape STRING: STRING as a literal POSIX extended regex
+  printf '%s' "$1" | sed 's/[][\.*^$+?(){}|]/\\&/g'
+}
+
+# exclude_path_lines HOME...: the ExcludePath lines for clamd.conf (daily scan only; clamonacc has its own list).
+# Every directory rule ends in (/|$) so it matches the directory itself and its contents, never a sibling
+# that only shares the prefix (/run matches, /runner does not). Rules inside homes are anchored to each
+# user's home, so the same folder name elsewhere (for example under ~/Downloads) is still scanned.
+exclude_path_lines() {
+  local home h
+  printf '%s\n' 'ExcludePath ^/(proc|sys|dev|run)(/|$)' 'ExcludePath ^/var/lib/docker(/|$)' \
+    'ExcludePath /node_modules(/|$)' 'ExcludePath /\.git/objects(/|$)'
+  for home in "$@"; do
+    h="$(regex_escape "${home%/}")"
+    printf 'ExcludePath ^%s/\\.local/share/containers(/|$)\n' "${h}"
+    printf 'ExcludePath ^%s/\\.cache/(thumbnails|fontconfig|mesa_shader_cache)(/|$)\n' "${h}"
+    if [[ "${EXCLUDE_DEV_CACHES}" -eq 1 ]]; then
+      printf 'ExcludePath ^%s/\\.cache(/|$)\n' "${h}"
+      printf 'ExcludePath ^%s/\\.npm/_cacache(/|$)\n' "${h}"
+      printf 'ExcludePath ^%s/\\.cargo/registry/cache(/|$)\n' "${h}"
+      printf 'ExcludePath ^%s/go/pkg/mod/cache/download(/|$)\n' "${h}"
+    fi
+  done
+}
+
+CPU_COUNT="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || true)"
+if [[ "${MAX_THREADS}" -eq 0 ]]; then MAX_THREADS="$(default_max_threads "${CPU_COUNT}")"; fi
+CONCURRENT_RELOAD="yes"
+[[ "${LOW_MEMORY}" -eq 1 ]] && CONCURRENT_RELOAD="no"
 MAX_QUEUE=$((MAX_THREADS * 2))
 (( MAX_QUEUE >= 100 )) || MAX_QUEUE=100
 ONACCESS_MAX_THREADS=$(((MAX_THREADS + 1) / 2))
@@ -185,23 +225,6 @@ canonicalize_paths() {
   done
 }
 declare -a WATCH_PATHS=() SCAN_PATHS=()
-
-# Daily-scan exclusions: written as ExcludePath to clamd.conf (POSIX ERE, searched in the full path) and used by the
-# daily scan's file count (grep -E, same semantics), so both always agree. One reason each:
-DAILY_EXCLUDES=(
-  '^/(proc|sys|dev)/'                 # pseudo filesystems, nothing to scan
-  '/node_modules/'                    # registry packages, very many small files; check the supply chain with npm audit
-  '/\.cache/'                         # regenerable caches (pip, npm, browsers); downloads land in ~/Downloads (scanned)
-  '/\.git/objects/'                   # packed history; the checked-out working tree is scanned
-  '/\.local/share/containers/'        # container image layers; scan images with an image scanner instead
-  '^/var/lib/docker/'                 # container image layers; scan images with an image scanner instead
-  '^/home/[^/]+/\.docker/desktop/vms/' # Docker Desktop VM disks (huge, guest filesystems not inspected) and vsock endpoints
-  '^/home/[^/]+/\.config/Code/CachedExtensionVSIXs/ms-python\.' # cached ms-python VS Code extension packages: their
-                                      # bundled binaries are reported as Heuristics.Broken.Executable (heuristic only)
-  '^/home/[^/]+/(\.config/herdr|\.local/share/zed|\.codex/ipc|\.docker/desktop)/[^/]+\.sock$' # these apps' Unix
-                                      # sockets: clamd cannot scan sockets ("Not supported file type" errors)
-)
-CLAMD_EXCLUDES="$(printf 'ExcludePath %s\n' "${DAILY_EXCLUDES[@]}")"
 canonicalize_paths WATCH_PATHS "${WATCH_CANDIDATES[@]+"${WATCH_CANDIDATES[@]}"}"
 canonicalize_paths SCAN_PATHS "${SCAN_CANDIDATES[@]}"
 [[ "${#SCAN_PATHS[@]}" -gt 0 ]] || warn "No valid daily-scan paths; add them later in /usr/local/bin/clamav-daily-scan."
@@ -325,19 +348,42 @@ check() {  # check STATUS NAME EVIDENCE
   if [[ "$1" == "WARN" ]]; then WARNS=$((WARNS + 1)); fi
   return 0
 }
+# clamconf_value FILE OPTION < clamconf output: the value clamconf parsed for OPTION in that config file
+# ("no" for a disabled boolean, empty when not shown).
+clamconf_value() {
+  awk -v file="$1" -v opt="$2" '
+    /^Config file: / { in_file = ($3 == file); next }
+    in_file && index($0, opt " = \"") == 1 { v = substr($0, length(opt) + 5); sub(/"$/, "", v); print v; exit }
+    in_file && $0 == opt " disabled" { print "no"; exit }
+  '
+}
+unit_started_after() {  # unit_started_after UNIT FILE...: the unit's main process started after every FILE changed
+  local started f
+  started="$(systemctl show -p ExecMainStartTimestamp --value --timestamp=unix "$1" 2>/dev/null)" || return 1
+  started="${started#@}"
+  [[ "${started}" =~ ^[0-9]+$ ]] || return 1
+  shift
+  for f in "$@"; do
+    [[ ! -e "${f}" || "$(stat -c %Y "${f}")" -le "${started}" ]] || return 1
+  done
+}
 # The user-readable report holds only fixed counters and status fields, never log lines with file names.
 # Raw diagnostics (with paths) go to a root-only file under /var/log/clamav.
 DIAG_FILE="/var/log/clamav/setup-diagnostics-${TS}.log"
 # Summarize a daily-scan log: numbers and a fixed result phrase only, never a raw line (file names stay out).
 SUMMARY_AWK_PROG="$(cat <<'SUMMARY_AWK'
-/^\[[0-9-]+ [0-9:]+\] Files in scope \(approx\.\): [0-9]+$/ { n = split($0, a, ": "); files = a[n] }
+/^\[[0-9-]+ [0-9:]+\] Starting / { files = ""; skipped = ""; vanished = ""; infected = ""; errors = ""; secs = ""; traversal = ""; result = "" }
+/^\[[0-9-]+ [0-9:]+\] Files to scan: [0-9]+$/ { n = split($0, a, ": "); files = a[n] }
+/^Special files skipped: [0-9]+$/ { split($0, a, ": "); skipped = a[2] }
+/^Vanished before scan: [0-9]+$/ { split($0, a, ": "); vanished = a[2] }
 /^Infected files: [0-9]+$/ { split($0, a, ": "); infected = a[2] }
 /^Total errors: [0-9]+$/ { split($0, a, ": "); errors = a[2] }
 /^Time: [0-9.]+ sec/ { split($0, a, " "); secs = a[2] }
-/^\[[0-9-]+ [0-9:]+\] Scan completed(: no threats found|: threats found| with error code [0-9]+)$/ { sub(/^\[[^]]*\] /, ""); result = $0 }
+/^\[[0-9-]+ [0-9:]+\] Scan (completed(: no threats found|: threats found| with error code [0-9]+)|incomplete: [a-z0-9][a-zA-Z0-9 ()/.-]*|aborted: [a-z0-9][a-zA-Z0-9 ()/.-]*)$/ { sub(/^\[[^]]*\] /, ""); result = $0 }
 /^\[[0-9-]+ [0-9:]+\] Traversal incomplete: find exit [0-9]+ / { traversal = "incomplete" }
 END {
-  printf "files~%s infected=%s errors=%s time=%ss traversal=%s result=%s\n", (files == "" ? "?" : files),
+  printf "files=%s skipped=%s vanished=%s infected=%s errors=%s time=%ss traversal=%s result=%s\n",
+    (files == "" ? "?" : files), (skipped == "" ? "?" : skipped), (vanished == "" ? "?" : vanished),
     (infected == "" ? "?" : infected), (errors == "" ? "?" : errors), (secs == "" ? "?" : secs),
     (traversal == "" ? "complete" : traversal), (result == "" ? "none" : result)
 }
@@ -453,6 +499,24 @@ write_file() {
   log "Updated ${path}"
 }
 
+# set_freshclam_checks FILE N: leaves exactly one active Checks directive, "Checks N", in place of the first one
+# (any whitespace, tabs included); later duplicates are dropped, comments and other lines are kept. The file is
+# backed up and rewritten only when this changes it, so repeated runs are stable. Owner and mode are kept.
+set_freshclam_checks() {
+  local file="$1" value="$2" tmp
+  tmp="$(mktemp)"
+  awk -v value="${value}" '
+    /^[[:space:]]*Checks([[:space:]]|$)/ { if (!done) { print "Checks " value; done = 1 }; next }
+    { print }
+    END { if (!done) print "Checks " value }
+  ' "${file}" >"${tmp}"
+  if cmp -s "${tmp}" "${file}"; then rm -f "${tmp}"; return 0; fi
+  cp -a "${file}" "${file}.${TS}.bak"
+  cat "${tmp}" >"${file}"
+  rm -f "${tmp}"
+  log "Updated ${file} (Checks ${value})"
+}
+
 write_daily_scan_script() {
   {
     cat <<'SCAN_HEAD'
@@ -461,14 +525,17 @@ set -uo pipefail
 umask 027
 
 LOG_FILE="/var/log/clamav/daily-scan.log"
+CLAMD_CONF="/etc/clamav/clamd.conf"
+# Every append to LOG_FILE holds this lock, and so does clamav-logrotate.service, so copytruncate never drops a line.
+# Directly in /run (root-only, 755), never in a world-writable directory such as /run/lock or /tmp, where another
+# local user could create it first and block the scan's reporting and the log rotation.
+LOG_LOCK="/run/clamav-daily-scan.lock"
 START_STAMP="$(date '+%Y-%m-%d %H:%M:%S')"
 ACTIVE_SCAN_PATHS=(
 SCAN_HEAD
     for path in "${SCAN_PATHS[@]+"${SCAN_PATHS[@]}"}"; do
       printf '  %q\n' "${path}"
     done
-    printf ')\nEXCLUDE_REGEXES=(\n'
-    printf '  %q\n' "${DAILY_EXCLUDES[@]}"
     cat <<'SCAN_BODY'
 )
 
@@ -477,60 +544,203 @@ touch "${LOG_FILE}"
 chown root:adm "${LOG_FILE}" 2>/dev/null || true
 chmod 0640 "${LOG_FILE}" 2>/dev/null || true
 
+log_append() {  # log_append < TEXT: append TEXT to the permanent log while holding the log lock (unlocked if the
+  # lock cannot be taken: the text is never dropped)
+  flock "${LOG_LOCK}" sh -c 'cat >>"$1"' sh "${LOG_FILE}" || cat >> "${LOG_FILE}"
+}
+log_line() { printf '%s\n' "$*" | log_append; }
+
 declare -a RUN_SCAN_PATHS=()
 for path in "${ACTIVE_SCAN_PATHS[@]}"; do
   if [[ -d "${path}" ]]; then
     RUN_SCAN_PATHS+=("${path}")
   else
     END_STAMP="$(date '+%Y-%m-%d %H:%M:%S')"
-    echo "[${END_STAMP}] Scan warning: configured path no longer exists: ${path}" >> "${LOG_FILE}"
+    log_line "[${END_STAMP}] Scan warning: configured path no longer exists: ${path}"
   fi
 done
 
 if [[ "${#RUN_SCAN_PATHS[@]}" -eq 0 ]]; then
   END_STAMP="$(date '+%Y-%m-%d %H:%M:%S')"
-  echo "[${END_STAMP}] Scan aborted: no valid scan paths were configured" >> "${LOG_FILE}"
+  log_line "[${END_STAMP}] Scan aborted: no valid scan paths were configured"
   exit 2
 fi
 
-echo "[${START_STAMP}] Starting parallel ClamAV daily scan for: ${RUN_SCAN_PATHS[*]}" >> "${LOG_FILE}"
+log_line "[${START_STAMP}] Starting parallel ClamAV daily scan for: ${RUN_SCAN_PATHS[*]}"
 
 if ! systemctl is-active --quiet clamav-daemon.service; then
   END_STAMP="$(date '+%Y-%m-%d %H:%M:%S')"
-  echo "[${END_STAMP}] Scan aborted: clamav-daemon.service is not running" >> "${LOG_FILE}"
+  log_line "[${END_STAMP}] Scan aborted: clamav-daemon.service is not running"
   exit 2
 fi
 
-# Approximate number of regular files in scope (same exclusions as ExcludePath in clamd.conf).
-# Regular files in scope, filtered with the same regexes as ExcludePath in clamd.conf (grep -E searches like clamd).
-# Sockets are not regular files. node_modules, .cache and .git/objects are pruned early for speed (also excluded).
+# Regular files only, byte-exact. Everything below runs in the C locale (bytes, not characters), and paths travel
+# NUL-delimited from find to clamdscan's arguments (xargs -0), so no file name is changed or dropped: invalid UTF-8,
+# carriage returns, newlines and long paths all reach clamd unchanged. One find pass sends special files (sockets,
+# FIFOs, block and character devices) to a separate list that is only counted, and regular files through the
+# ExcludePath rules of clamd.conf (grep -E searches each path as clamd does) into the one copy of the scan list.
+# Symbolic links are not followed (as FollowFileSymlinks false).
+export LC_ALL=C
+START_EPOCH="$(date +%s)"
+BATCH_SIZE=500
 FIND_RC=0
-FILE_COUNT="$(find "${RUN_SCAN_PATHS[@]}" -xdev -type d \( -name node_modules -o -name .cache -o -path '*/.git/objects' \) -prune \
-  -o -type f -print0 2>/dev/null \
-  | { grep -z -E -v -f <(printf '%s\n' "${EXCLUDE_REGEXES[@]+"${EXCLUDE_REGEXES[@]}"}") || true; } \
-  | tr -cd '\0' | wc -c; exit "${PIPESTATUS[0]}")" || FIND_RC=$?
-echo "[${START_STAMP}] Files in scope (approx.): ${FILE_COUNT}" >> "${LOG_FILE}"
+XARGS_PID=""
+XARGS_RC=0
+INTERRUPTED=""
+SPECIAL_COUNT="?"
+FILE_COUNT=0
+
+stamp() { date '+%Y-%m-%d %H:%M:%S'; }
+abort_prep() {  # abort_prep REASON: the scan list could not be prepared, so nothing is scanned
+  log_line "[$(stamp)] Scan aborted: cannot prepare the scan list (${1})"
+  exit 2
+}
+
+WORK_DIR="$(mktemp -d "${TMPDIR:-/var/tmp}/clamav-daily-scan.XXXXXX")" || abort_prep "mktemp failed"
+BATCHES="${WORK_DIR}/batches"
+export WORK_DIR BATCHES LOG_FILE LOG_LOCK
+cleanup_work() {  # exact names only, never recursive; by now every batch output is in the permanent log
+  rm -f -- "${WORK_DIR}/files.0" "${WORK_DIR}/special.0" "${BATCHES}" "${WORK_DIR}"/batch.*
+  rmdir -- "${WORK_DIR}" 2>/dev/null || true
+}
+trap cleanup_work EXIT
+
+# run_batch FILE...: one clamdscan client for these files. clamdscan has no --log here (parallel clients cannot share
+# one: it is locked exclusively); its output goes to a file of its own, which is appended to the permanent log under
+# the log lock when the batch ends, together with one status record "STATUS FILES FOUND VANISHED ERRORS BATCHFILE".
+# The totals of the run come only from these records, never from the permanent log, so a log rotation during the
+# scan cannot change them. With --infected
+# --no-summary clamdscan prints only detections and problems, so every other non-empty line is an error, except a
+# vanished file: one that "Can't access file" names exactly as it was passed and that no longer exists. STATUS is
+# 0 clean, 1 found, 2 failed (clamdscan exited above 2, reported an error, or exited non-zero without saying why).
+run_batch() {
+  local out rc=0 found errors=0 vanished=0 status line gone f
+  out="$(mktemp "${WORK_DIR}/batch.XXXXXX")" || return 0
+  /usr/bin/clamdscan --fdpass --infected --no-summary "$@" >"${out}" 2>&1 || rc=$?
+  found="$(grep -a -c ' FOUND$' "${out}")"
+  [[ "$?" -le 1 ]] || found=-1
+  while IFS= read -r line; do
+    if [[ "${line}" == "ERROR: Can't access file "* ]]; then
+      gone="${line#"ERROR: Can't access file "}"
+      if [[ ! -e "${gone}" && ! -L "${gone}" ]]; then
+        for f in "$@"; do
+          if [[ "${f}" == "${gone}" ]]; then vanished=$((vanished + 1)); continue 2; fi
+        done
+      fi
+    fi
+    errors=$((errors + 1))
+  done < <(grep -a -v -e ' FOUND$' -e '^$' "${out}")
+  if [[ "${found}" -lt 0 || "${rc}" -gt 2 || "${errors}" -gt 0 || ( "${rc}" -eq 2 && "${vanished}" -eq 0 ) \
+        || ( "${rc}" -eq 1 && "${found}" -eq 0 ) ]]; then
+    status=2
+  elif [[ "${found}" -gt 0 ]]; then
+    status=1
+  else
+    status=0
+  fi
+  flock "${LOG_LOCK}" sh -c 'cat -- "$1" >>"$2" && printf "%s %s %s %s %s %s\n" "$3" "$4" "$5" "$6" "$7" "${1##*/}" >>"$8" \
+    && rm -f -- "$1"' sh "${out}" "${LOG_FILE}" "${status}" "$#" "${found}" "${vanished}" "${errors}" "${BATCHES}"
+  return 0  # the outcome is in the status record; xargs must go on with the other batches
+}
+export -f run_batch
+
+# finish: totals of this run from the batch records, then the summary, the result line and the exit status. Also runs
+# on SIGTERM/SIGINT: a batch that had not finished has no record, so its detections are counted from its own output
+# file, which is then appended to the permanent log; the run is marked incomplete.
+finish() {
+  local out n partial=0 counted=1 totals batches failed scanned found vanished errors infected result status secs summary
+  trap - TERM INT
+  : >>"${BATCHES}"
+  for out in "${WORK_DIR}"/batch.*; do
+    [[ -f "${out}" ]] || continue
+    if ! awk -v name="${out##*/}" '$6 == name { seen = 1 } END { exit !seen }' "${BATCHES}"; then
+      n="$(grep -a -c ' FOUND$' "${out}")"
+      if [[ "$?" -le 1 ]]; then partial=$((partial + n)); else counted=0; fi
+      log_append <"${out}"
+    fi
+    rm -f -- "${out}"
+  done
+  totals="$(awk '{ n++; if ($1 >= 2) failed++; else scanned += $2; if ($3 > 0) found += $3; vanished += $4; errors += $5 }
+    END { printf "%d %d %d %d %d %d\n", n, failed, scanned, found, vanished, errors }' "${BATCHES}")" || counted=0
+  read -r batches failed scanned found vanished errors <<<"${totals:-0 0 0 0 0 0}"
+  infected="?"
+  [[ "${counted}" -eq 0 ]] || infected=$((found + partial))
+  if [[ -n "${INTERRUPTED}" ]]; then
+    result="Scan incomplete: interrupted by ${INTERRUPTED}"; status=2
+  elif [[ "${FIND_RC}" -ne 0 ]]; then
+    result="Scan incomplete: traversal failed (find exit ${FIND_RC})"; status=2
+  elif [[ "${XARGS_RC}" -ne 0 ]]; then
+    result="Scan incomplete: clamdscan batches could not be run (xargs exit ${XARGS_RC})"; status=2
+  elif [[ "${failed}" -gt 0 ]]; then
+    result="Scan incomplete: ${failed} of ${batches} clamdscan batches failed"; status=2
+  elif [[ "${scanned}" -ne "${FILE_COUNT}" ]]; then
+    result="Scan incomplete: ${scanned} of ${FILE_COUNT} files scanned"; status=2
+  elif [[ "${infected}" == "?" ]]; then
+    result="Scan incomplete: cannot count the results"; status=2
+  elif [[ "${infected}" -gt 0 ]]; then
+    result="Scan completed: threats found"; status=1
+  else
+    result="Scan completed: no threats found"; status=0
+  fi
+  secs=$(( $(date +%s) - START_EPOCH ))
+  summary="$(printf '\n%s\n' "----------- SCAN SUMMARY -----------"
+    printf '%s\n' "Files scanned: ${scanned} of ${FILE_COUNT}" "Infected files: ${infected}" "Total errors: ${errors}" \
+      "Failed batches: ${failed}" "Vanished before scan: ${vanished}" "Special files skipped: ${SPECIAL_COUNT}" \
+      "Time: ${secs}.000 sec ($((secs / 60)) m $((secs % 60)) s)")"
+  printf '%s\n' "${summary}"
+  printf '%s\n[%s] %s\n' "${summary}" "$(stamp)" "${result}" | log_append
+  exit "${status}"
+}
+on_signal() {  # on_signal NAME: stop xargs and every batch (workers first, then their clamdscan), then finish
+  local pid i
+  declare -a tree=()
+  INTERRUPTED="$1"
+  if [[ -n "${XARGS_PID}" ]]; then
+    tree=("${XARGS_PID}")
+    for (( i = 0; i < ${#tree[@]}; i++ )); do
+      for pid in $(pgrep -P "${tree[$i]}"); do tree+=("${pid}"); done
+    done
+    kill -TERM "${tree[@]}" 2>/dev/null
+    wait "${XARGS_PID}" 2>/dev/null
+  fi
+  finish
+}
+trap 'on_signal SIGTERM' TERM
+trap 'on_signal SIGINT' INT
+
+[[ -r "${CLAMD_CONF}" ]] || abort_prep "cannot read ${CLAMD_CONF}"
+declare -a EXCLUDE_ARGS=(-e '^$')
+while IFS= read -r rule; do
+  EXCLUDE_ARGS+=(-e "${rule}")
+done < <(sed -n 's/^ExcludePath[[:space:]]\{1,\}//p' "${CLAMD_CONF}")
+
+# grep exit status: 0 = lines selected, 1 = none selected (an empty list is valid), 2 or more = failure.
+find "${RUN_SCAN_PATHS[@]}" -xdev \( \( -type s -o -type p -o -type b -o -type c \) -fprint0 "${WORK_DIR}/special.0" \) \
+  -o \( -type f -print0 \) 2>/dev/null | grep -azEv "${EXCLUDE_ARGS[@]}" >"${WORK_DIR}/files.0"
+PIPE_RC=("${PIPESTATUS[@]}")
+FIND_RC="${PIPE_RC[0]}"
+[[ "${PIPE_RC[1]}" -le 1 ]] || abort_prep "path filter failed (grep exit ${PIPE_RC[1]})"
+[[ -f "${WORK_DIR}/special.0" ]] || abort_prep "special-file list was not written"
+SPECIAL_COUNT="$(grep -azEvc "${EXCLUDE_ARGS[@]}" "${WORK_DIR}/special.0")"
+[[ "$?" -le 1 && "${SPECIAL_COUNT}" =~ ^[0-9]+$ ]] || abort_prep "special-file count failed"
+rm -f -- "${WORK_DIR}/special.0"
+FILE_COUNT="$(tr -cd '\0' <"${WORK_DIR}/files.0" | wc -c)" || abort_prep "file count failed"
+[[ "${FILE_COUNT}" =~ ^[0-9]+$ ]] || abort_prep "file count failed"
+log_line "[${START_STAMP}] Files to scan: ${FILE_COUNT}"
+log_line "[${START_STAMP}] Special files skipped: ${SPECIAL_COUNT}"
 if [[ "${FIND_RC}" -ne 0 ]]; then
-  echo "[${START_STAMP}] Traversal incomplete: find exit ${FIND_RC} (unreadable or vanished paths); the count is a minimum" >> "${LOG_FILE}"
+  log_line "[${START_STAMP}] Traversal incomplete: find exit ${FIND_RC} (unreadable or vanished paths); the listed files are still scanned"
 fi
 
-if /usr/bin/clamdscan --multiscan --fdpass --infected --log="${LOG_FILE}" "${RUN_SCAN_PATHS[@]}"; then
-  STATUS=0
-else
-  STATUS=$?
-fi
-
-END_STAMP="$(date '+%Y-%m-%d %H:%M:%S')"
-
-if [[ "${STATUS}" -eq 0 ]]; then
-  echo "[${END_STAMP}] Scan completed: no threats found" >> "${LOG_FILE}"
-elif [[ "${STATUS}" -eq 1 ]]; then
-  echo "[${END_STAMP}] Scan completed: threats found" >> "${LOG_FILE}"
-else
-  echo "[${END_STAMP}] Scan completed with error code ${STATUS}" >> "${LOG_FILE}"
-fi
-
-exit "${STATUS}"
+# xargs runs batches of up to BATCH_SIZE files on as many parallel clamdscan clients as clamd has threads (MaxThreads).
+JOBS="$(sed -n 's/^MaxThreads[[:space:]]\{1,\}\([1-9][0-9]*\)[[:space:]]*$/\1/p' "${CLAMD_CONF}" | tail -n 1)"
+[[ "${JOBS}" =~ ^[1-9][0-9]*$ ]] || JOBS=1
+xargs -0 -r -n "${BATCH_SIZE}" -P "${JOBS}" -a "${WORK_DIR}/files.0" bash -c 'run_batch "$@"' run_batch \
+  >/dev/null 2>&1 &
+XARGS_PID=$!
+wait "${XARGS_PID}" || XARGS_RC=$?
+XARGS_PID=""
+finish
 SCAN_BODY
   } | write_file /usr/local/bin/clamav-daily-scan 0755 root:root
 }
@@ -576,9 +786,12 @@ APT_AUTO
   fi
 
   mkdir -p /etc/clamav /etc/systemd/system/clamav-clamonacc.service.d /etc/systemd/system/clamav-freshclam.service.d \
+    /etc/systemd/system/clamav-daemon.service.d \
     /var/lib/clamav/quarantine /var/log/clamav
 
-  # ExcludePath lines come from DAILY_EXCLUDES (reasons listed there).
+  # ExcludePath is the daily-scan policy (clamdscan applies it while walking the tree); see exclude_path_lines.
+  # It does not filter on-access scans: clamonacc uses its own directory list, /etc/clamav/onaccess.exclude.
+  EXCLUDE_PATH_LINES="$(exclude_path_lines "${TARGET_HOMES[@]+"${TARGET_HOMES[@]}"}")"
   write_file /etc/clamav/clamd.conf 0644 root:root <<CLAMD
 # Managed by setup-clamav-ubuntu.sh
 LocalSocket /var/run/clamav/clamd.ctl
@@ -665,7 +878,10 @@ LogFileMaxSize 0
 Bytecode true
 BytecodeSecurity TrustSigned
 BytecodeTimeout 60000
-${CLAMD_EXCLUDES}
+${EXCLUDE_PATH_LINES}
+# yes: new signatures load next to the old set, so scanning never pauses (peak memory about twice the set).
+# --low-memory sets no: reload in place, scans wait until the reload finishes.
+ConcurrentDatabaseReload ${CONCURRENT_RELOAD}
 OnAccessMaxFileSize 25M
 OnAccessMaxThreads ${ONACCESS_MAX_THREADS}
 # clamd and root-owned system processes (package manager, backups, the daily scan) do not trigger
@@ -684,6 +900,8 @@ CLAMD
   else
     write_file /etc/clamav/onaccess.watch 0644 root:root </dev/null
   fi
+  # On-access exclusions are a separate policy from ExcludePath: clamonacc --exclude-list takes explicit
+  # directory paths (no regex). The installer creates the list empty and never changes an existing one.
   if [[ ! -f /etc/clamav/onaccess.exclude ]]; then : >/etc/clamav/onaccess.exclude; fi
 
   # clamonacc watches folders recursively with inotify; make sure the per-user watch limit has headroom.
@@ -716,6 +934,40 @@ RestartSec=10s
 UMask=0027
 OVERRIDE
 
+  # False-positive allowlist by exact file hash (ClamAV .sfp format sha256:size:name, loaded by clamd with the
+  # signatures). Only these exact files are exempt; the Heuristics.Broken.Executable heuristic and every signature
+  # stay active for all other files. Comment lines are provenance and are stripped before installing.
+  grep -v -E '^[[:space:]]*(#|$)' <<'FP_ALLOWLIST' | write_file /var/lib/clamav/local.sfp 0644 clamav:clamav
+# Official VS Code Marketplace packages (targetPlatform=linux-x64), downloaded 2026-11-02 from
+# https://marketplace.visualstudio.com/_apis/public/gallery/publishers/ms-python/vsextensions/<name>/<version>/vspackage
+# and byte-identical to the copies VS Code caches in ~/.config/Code/CachedExtensionVSIXs/. Each bundles
+# extension/python-env-tools/bin/pet (a 34-35 MB ELF, above MaxFileSize 25M), reported as Heuristics.Broken.Executable.
+1d07e60d5eab257ea5d691b26def3fff642b4d2c04fab94424e8b8fe25baf656:17823311:ms-python.python-2026.4.0-linux-x64.vsix
+7cea86fc649098a0c7037275d31fe6f6ae5446348f028587aa0fce7d9b73e35f:12859354:ms-python.vscode-python-envs-1.36.0-linux-x64.vsix
+FP_ALLOWLIST
+
+  # The daily-scan unit's Nice only affects the clamdscan client; the scanning work runs inside clamd.
+  # clamd and the daily scan run in clamav.slice, a top-level slice with CPUWeight=20: when the CPU is
+  # contended it gets 20 shares against 100 each for user.slice and system.slice, when it is idle it may use
+  # every CPU. A weight, not a hard quota, so on-access scans are never capped on an idle machine.
+  write_file /etc/systemd/system/clamav.slice 0644 root:root <<'SLICE'
+# Managed by setup-clamav-ubuntu.sh
+[Unit]
+Description=ClamAV scanning (low CPU weight under contention)
+
+[Slice]
+CPUWeight=20
+SLICE
+  write_file /etc/systemd/system/clamav-daemon.service.d/desktop-limits.conf 0644 root:root <<'DAEMONLIMITS'
+# Managed by setup-clamav-ubuntu.sh
+[Service]
+Slice=clamav.slice
+DAEMONLIMITS
+
+  # 12 signature checks a day (every 2 h) instead of 24. Set in debconf too so package upgrades keep it.
+  echo "clamav-freshclam clamav-freshclam/update_interval string 12" | debconf-set-selections
+  if [[ -f /etc/clamav/freshclam.conf ]]; then set_freshclam_checks /etc/clamav/freshclam.conf 12; fi
+
   # freshclam can start before DNS works after boot; wait up to 60 s for the mirror name.
   write_file /etc/systemd/system/clamav-freshclam.service.d/wait-dns.conf 0644 root:root <<'WAITDNS'
 [Service]
@@ -738,6 +990,8 @@ Type=oneshot
 ExecStart=/usr/local/bin/clamav-daily-scan
 SuccessExitStatus=1
 TimeoutStartSec=6h
+# Same low-weight slice as clamd; it runs one clamdscan worker per clamd thread (MaxThreads).
+Slice=clamav.slice
 Nice=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=7
@@ -790,7 +1044,8 @@ Description=Rotate the ClamAV on-access and daily-scan logs
 
 [Service]
 Type=oneshot
-ExecStart=/usr/sbin/logrotate -s /var/lib/logrotate/clamav.status /etc/clamav/logrotate.conf
+# Same lock as the daily scan's appends to daily-scan.log: copytruncate never runs in the middle of an append.
+ExecStart=/usr/bin/flock /run/clamav-daily-scan.lock /usr/sbin/logrotate -s /var/lib/logrotate/clamav.status /etc/clamav/logrotate.conf
 Nice=19
 IOSchedulingClass=idle
 LRSERVICE
@@ -909,6 +1164,41 @@ else
 fi
 if grep -q '^OnAccessPrevention true' /etc/clamav/clamd.conf; then check INFO "on-access prevention" "on (files blocked until scanned)"
 else check INFO "on-access prevention" "off (detect, log and quarantine)"; fi
+fp_entries="$(grep -c -E '^[0-9a-f]{64}:[0-9]+:' /var/lib/clamav/local.sfp 2>/dev/null || true)"
+check INFO "false-positive allowlist" "${fp_entries:-0} exact file hash(es) in /var/lib/clamav/local.sfp"
+
+# Effective tuning: what systemd and the ClamAV parser actually load, and whether the running services
+# started after the files changed. Files alone are never reported as deployed.
+eff_slice="$(systemctl show -p Slice --value clamav-daemon.service 2>/dev/null || true)"
+eff_weight="$(systemctl show -p CPUWeight --value clamav.slice 2>/dev/null || true)"
+eff_reload="$(systemctl show -p NeedDaemonReload --value clamav-daemon.service 2>/dev/null || true)"
+if [[ "${eff_slice}" == clamav.slice && "${eff_weight}" == 20 && "${eff_reload}" == no ]]; then
+  check PASS "clamd CPU weight (effective)" "Slice=clamav.slice, CPUWeight=20"
+else
+  check FAIL "clamd CPU weight (effective)" "Slice=${eff_slice:-?} CPUWeight=${eff_weight:-?} NeedDaemonReload=${eff_reload:-?}"
+fi
+eff_threads="$(clamconf_value clamd.conf MaxThreads <<<"${clamconf_out}")"
+eff_concurrent="$(clamconf_value clamd.conf ConcurrentDatabaseReload <<<"${clamconf_out}")"
+eff_checks="$(clamconf_value freshclam.conf Checks <<<"${clamconf_out}")"
+eff_evidence="MaxThreads=${eff_threads:-?} ConcurrentDatabaseReload=${eff_concurrent:-?} Checks=${eff_checks:-?}"
+if [[ "${VERIFY_ONLY}" -eq 1 ]]; then
+  check INFO "tuning (parsed by clamconf)" "${eff_evidence}"
+elif [[ "${eff_threads}" == "${MAX_THREADS}" && "${eff_concurrent}" == "${CONCURRENT_RELOAD}" && "${eff_checks}" == 12 ]]; then
+  check PASS "tuning (parsed by clamconf)" "${eff_evidence}"
+else
+  check FAIL "tuning (parsed by clamconf)" "${eff_evidence}; expected MaxThreads=${MAX_THREADS} ConcurrentDatabaseReload=${CONCURRENT_RELOAD} Checks=12"
+fi
+if unit_started_after clamav-daemon.service /etc/clamav/clamd.conf /etc/systemd/system/clamav.slice \
+  /etc/systemd/system/clamav-daemon.service.d/desktop-limits.conf; then
+  check PASS "clamd runs the current config" "started after the last change"
+else
+  check FAIL "clamd runs the current config" "clamd.conf or its unit changed after clamd started; restart clamav-daemon"
+fi
+if unit_started_after clamav-freshclam.service /etc/clamav/freshclam.conf; then
+  check PASS "freshclam runs the current config" "started after the last change"
+else
+  check FAIL "freshclam runs the current config" "freshclam.conf changed after freshclam started; restart clamav-freshclam"
+fi
 
 selftest_dir="$(mktemp -d /var/tmp/clamav-selftest.XXXXXX)"
 CLEANUP_ROOT_DIRS+=("${selftest_dir}")
@@ -1026,16 +1316,16 @@ if [[ "${RUN_FULL_SCAN}" -eq 1 ]]; then
   status="$(systemctl show -p ExecMainStatus --value clamav-daily-scan.service)"
   summary="$(tail -n +"$((log_lines_before + 1))" /var/log/clamav/daily-scan.log 2>/dev/null | awk "${SUMMARY_AWK_PROG}" || true)"
   errors="$(printf '%s' "${summary}" | sed -n 's/.* errors=\([0-9]*\) .*/\1/p')"
-  files="$(printf '%s' "${summary}" | sed -n 's/^files~\([0-9]*\) .*/\1/p')"
+  files="$(printf '%s' "${summary}" | sed -n 's/^files=\([0-9]*\) .*/\1/p')"
   if [[ "${result}" == success && "${status}" =~ ^[01]$ && "${errors}" == 0 && "${files:-0}" =~ ^[1-9][0-9]*$ \
         && "${summary}" == *"result=Scan completed"* ]]; then
-    check PASS "daily scan run" "result=${result} exit=${status} errors=0 files~${files}"
+    check PASS "daily scan run" "result=${result} exit=${status} errors=0 files=${files}"
   else
-    check FAIL "daily scan run" "result=${result} exit=${status} errors=${errors:-missing} files~${files:-missing}"
+    check FAIL "daily scan run" "result=${result} exit=${status} errors=${errors:-missing} files=${files:-missing}"
   fi
   report "      ${summary}"
   if [[ "${summary}" == *"traversal=incomplete"* ]]; then
-    check WARN "daily scan file count" "traversal incomplete (unreadable or vanished paths); count is a minimum"
+    check FAIL "daily scan coverage" "traversal incomplete (unreadable or vanished paths): not every file was listed"
   fi
   journal_rc=0
   journal_out="$(journalctl -k --since "${scan_start}" --no-pager -q 2>/dev/null)" || journal_rc=$?
