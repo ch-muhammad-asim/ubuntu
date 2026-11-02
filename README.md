@@ -16,10 +16,11 @@ The ClamAV setup in this repository provides:
 - automatic signature updates
 - unattended Ubuntu security upgrades for ClamAV package updates
 - a running `clamd` daemon for faster scans
-- a daily scheduled scan through `systemd`
-- on-access scanning for common user folders
+- a daily scheduled scan of each protected user's home through `systemd`
+- on-access scanning for the common folders of one or more users, plus `/tmp`
 - quarantine-on-detection
-- verification guidance, including an EICAR test flow
+- log rotation for every ClamAV log, none world-readable
+- an idempotent installer that repairs drift and writes a verification report (`--verify` to only check), including EICAR tests
 
 ## Quick Start
 
