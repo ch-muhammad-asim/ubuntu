@@ -90,12 +90,20 @@ MOCK_BIN="${TEMP_DIR}/bin"
 CAPTURE_FILE="${TEMP_DIR}/clamdscan.args"
 SCAN_LOG="${TEMP_DIR}/daily-scan.log"
 
-mkdir -p "${SCAN_ROOT}" "${MOCK_BIN}"
+mkdir -p "${SCAN_ROOT}" "${MOCK_BIN}" "${SCAN_ROOT}/skipme" "${SCAN_ROOT}/node_modules/pkg" "${SCAN_ROOT}/keep"
+printf 'a\n' >"${SCAN_ROOT}/keep/a.txt"
+printf 'b\n' >"${SCAN_ROOT}/skipme/b.txt"
+printf 'c\n' >"${SCAN_ROOT}/node_modules/pkg/c.js"
+printf 'd\n' >"${SCAN_ROOT}/d.txt"
+# a REGULAR file named node_modules is not excluded by the regexes, so it must be counted (prune is for directories only)
+printf 'e\n' >"${SCAN_ROOT}/keep/node_modules"
 extract_heredoc SCAN_HEAD "${SCAN_HEAD}"
 extract_heredoc SCAN_BODY "${SCAN_BODY}"
 {
   cat "${SCAN_HEAD}"
   printf '  %q\n' "${SCAN_ROOT}" "${MISSING_ROOT}"
+  printf ')\nEXCLUDE_REGEXES=(\n'
+  printf '  %q\n' '/skipme/' '/node_modules/'
   cat "${SCAN_BODY}"
 } >"${GENERATED_SCAN}"
 
@@ -125,7 +133,7 @@ assert_contains "${CAPTURE_FILE}" "${SCAN_ROOT}"
 assert_not_contains "${CAPTURE_FILE}" "${MISSING_ROOT}"
 assert_contains "${SCAN_LOG}" "configured path no longer exists: ${MISSING_ROOT}"
 assert_contains "${SCAN_LOG}" "Scan completed: no threats found"
-assert_contains "${SCAN_LOG}" "Files in scope (approx.):"
+assert_contains "${SCAN_LOG}" "Files in scope (approx.): 3"
 [[ "$(stat -c %a "${SCAN_LOG}")" == 640 ]] || fail "Expected daily-scan.log mode 640, got $(stat -c %a "${SCAN_LOG}")"
 pass "daily scanner uses parallel fd passing, skips stale paths and keeps its log private"
 
@@ -435,7 +443,7 @@ pass "EICAR self-tests: exact-name cleanup as the user, rmdir only, quarantine b
 
 CLAMD_RAW="${TEMP_DIR}/clamd.raw"
 extract_heredoc CLAMD "${CLAMD_RAW}"
-for option in "HeuristicAlerts true" "AlertBrokenExecutables true" "ExcludePath ^/(proc|sys|dev)/" \
+for option in "HeuristicAlerts true" "AlertBrokenExecutables true" '${CLAMD_EXCLUDES}' \
   "OnAccessExcludeUname clamav" "OnAccessExcludeRootUID true" "LocalSocketMode 660" \
   "TemporaryDirectory /var/lib/clamav/tmp" "OnAccessExtraScanning true" "OnAccessDenyOnError false"; do
   assert_contains "${CLAMD_RAW}" "${option}"
@@ -443,6 +451,29 @@ done
 for option in AlgorithmicDetection ArchiveBlockEncrypted PhishingAlwaysBlock "PartitionIntersection false" OLE2BlockMacros; do
   if grep -Eq "^${option}" "${CLAMD_RAW}"; then fail "Deprecated clamd option still present: ${option}"; fi
 done
+# The real DAILY_EXCLUDES regexes (the single source for ExcludePath and the file count).
+EXCLUDES_FILE="${TEMP_DIR}/daily-excludes.sh"
+awk '/^DAILY_EXCLUDES=\(/ { capture = 1 } capture { print } capture && /^\)$/ { exit }' "${INSTALLER}" >"${EXCLUDES_FILE}"
+EXCLUDE_PATTERNS="${TEMP_DIR}/daily-excludes.txt"
+( . "${EXCLUDES_FILE}"; printf '%s\n' "${DAILY_EXCLUDES[@]}" ) >"${EXCLUDE_PATTERNS}"
+[[ "$(grep -c . "${EXCLUDE_PATTERNS}")" -ge 9 ]] || fail "DAILY_EXCLUDES not found or incomplete"
+excluded() { printf '%s\n' "$1" | grep -q -E -f "${EXCLUDE_PATTERNS}"; }
+for p in /home/u/.config/herdr/herdr.sock /home/u/.config/herdr/herdr-client.sock /home/u/.local/share/zed/zed-stable.sock \
+  /home/u/.codex/ipc/ipc.sock /home/u/.docker/desktop/backend.sock /home/u/.docker/desktop/vms/0/00000002.000007cf \
+  /home/u/.config/Code/CachedExtensionVSIXs/ms-python.python-2026.4.0-linux-x64 \
+  /home/u/.config/Code/CachedExtensionVSIXs/ms-python.vscode-python-envs-1.36.0-linux-x64 \
+  /proc/1/status /home/u/src/app/node_modules/x/index.js /home/u/.cache/pip/x; do
+  excluded "${p}" || fail "exclusion misses ${p}"
+done
+for p in /home/u/Downloads/evil.sock /home/u/Desktop/x.sock /home/u/Documents/report.pdf \
+  /home/u/.local/share/Trash/files/evil.sock /home/u/.config/other/evil.sock /home/u/.config/herdr/sub/x.sock \
+  /home/u/Documents/project/.docker/desktop/vms/data /home/u/Downloads/.docker/desktop/vms/x \
+  /home/u/.config/Code/CachedExtensionVSIXs/other.extension-1.0 /home/u/.config/Code/User/settings.json \
+  /home/u/Downloads/ms-python.python.vsix /home/u/.docker/config.json; do
+  if excluded "${p}"; then fail "exclusion wrongly matches ${p}"; fi
+done
+assert_contains "${INSTALLER}" "CLAMD_EXCLUDES=\"\$(printf 'ExcludePath %s\\n' \"\${DAILY_EXCLUDES[@]}\")\""
+assert_contains "${INSTALLER}" "printf '  %q\\n' \"\${DAILY_EXCLUDES[@]}\""
 pass "clamd.conf uses current option names and the hardening defaults"
 
 # clamdscan exits 1 when it detects EICAR; under pipefail it must not be piped into grep.
@@ -489,7 +520,11 @@ if command -v clamd >/dev/null 2>&1; then
     -e "s/\${MAX_QUEUE}/100/g" \
     -e "s/\${ONACCESS_MAX_THREADS}/2/g" \
     -e "s/\${PREVENTION_VALUE}/false/g" \
-    "${CLAMD_TEMPLATE}" >"${CLAMD_CONFIG}"
+    "${CLAMD_TEMPLATE}" >"${CLAMD_CONFIG}.partial"
+  awk -v excludes="${EXCLUDE_PATTERNS}" '
+    $0 == "${CLAMD_EXCLUDES}" { while ((getline line < excludes) > 0) print "ExcludePath " line; next }
+    { print }' "${CLAMD_CONFIG}.partial" >"${CLAMD_CONFIG}"
+  grep -q '^ExcludePath ^/home/\[^/\]+/\\.docker/desktop/vms/' "${CLAMD_CONFIG}" || fail "generated clamd.conf lacks the ExcludePath lines"
 
   set +e
   timeout 5 clamd --foreground --config-file="${CLAMD_CONFIG}" >"${CLAMD_OUTPUT}" 2>&1

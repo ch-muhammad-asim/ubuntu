@@ -36,6 +36,12 @@ Run the installer:
 sudo bash clamav/setup-clamav-ubuntu.sh
 ```
 
+Without `--user` it protects only the user who runs `sudo`. To protect several users, name each one, every time you run it (a run replaces the watched and scanned paths):
+
+```bash
+sudo bash clamav/setup-clamav-ubuntu.sh --user alice --user bob
+```
+
 ## Suggested Repo Direction
 
 This layout is intentionally simple:

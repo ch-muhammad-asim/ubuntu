@@ -185,6 +185,23 @@ canonicalize_paths() {
   done
 }
 declare -a WATCH_PATHS=() SCAN_PATHS=()
+
+# Daily-scan exclusions: written as ExcludePath to clamd.conf (POSIX ERE, searched in the full path) and used by the
+# daily scan's file count (grep -E, same semantics), so both always agree. One reason each:
+DAILY_EXCLUDES=(
+  '^/(proc|sys|dev)/'                 # pseudo filesystems, nothing to scan
+  '/node_modules/'                    # registry packages, very many small files; check the supply chain with npm audit
+  '/\.cache/'                         # regenerable caches (pip, npm, browsers); downloads land in ~/Downloads (scanned)
+  '/\.git/objects/'                   # packed history; the checked-out working tree is scanned
+  '/\.local/share/containers/'        # container image layers; scan images with an image scanner instead
+  '^/var/lib/docker/'                 # container image layers; scan images with an image scanner instead
+  '^/home/[^/]+/\.docker/desktop/vms/' # Docker Desktop VM disks (huge, guest filesystems not inspected) and vsock endpoints
+  '^/home/[^/]+/\.config/Code/CachedExtensionVSIXs/ms-python\.' # cached ms-python VS Code extension packages: their
+                                      # bundled binaries are reported as Heuristics.Broken.Executable (heuristic only)
+  '^/home/[^/]+/(\.config/herdr|\.local/share/zed|\.codex/ipc|\.docker/desktop)/[^/]+\.sock$' # these apps' Unix
+                                      # sockets: clamd cannot scan sockets ("Not supported file type" errors)
+)
+CLAMD_EXCLUDES="$(printf 'ExcludePath %s\n' "${DAILY_EXCLUDES[@]}")"
 canonicalize_paths WATCH_PATHS "${WATCH_CANDIDATES[@]+"${WATCH_CANDIDATES[@]}"}"
 canonicalize_paths SCAN_PATHS "${SCAN_CANDIDATES[@]}"
 [[ "${#SCAN_PATHS[@]}" -gt 0 ]] || warn "No valid daily-scan paths; add them later in /usr/local/bin/clamav-daily-scan."
@@ -450,6 +467,8 @@ SCAN_HEAD
     for path in "${SCAN_PATHS[@]+"${SCAN_PATHS[@]}"}"; do
       printf '  %q\n' "${path}"
     done
+    printf ')\nEXCLUDE_REGEXES=(\n'
+    printf '  %q\n' "${DAILY_EXCLUDES[@]}"
     cat <<'SCAN_BODY'
 )
 
@@ -483,10 +502,14 @@ if ! systemctl is-active --quiet clamav-daemon.service; then
 fi
 
 # Approximate number of regular files in scope (same exclusions as ExcludePath in clamd.conf).
+# Regular files in scope, filtered with the same regexes as ExcludePath in clamd.conf (grep -E searches like clamd).
+# Sockets are not regular files. node_modules, .cache and .git/objects are pruned early for speed (also excluded).
 FIND_RC=0
-FILE_DOTS="$(find "${RUN_SCAN_PATHS[@]}" -xdev \( -name node_modules -o -name .cache -o -path '*/.git/objects' \
-  -o -path '*/.local/share/containers' -o -path /var/lib/docker \) -prune -o -type f -printf . 2>/dev/null)" || FIND_RC=$?
-echo "[${START_STAMP}] Files in scope (approx.): ${#FILE_DOTS}" >> "${LOG_FILE}"
+FILE_COUNT="$(find "${RUN_SCAN_PATHS[@]}" -xdev -type d \( -name node_modules -o -name .cache -o -path '*/.git/objects' \) -prune \
+  -o -type f -print0 2>/dev/null \
+  | { grep -z -E -v -f <(printf '%s\n' "${EXCLUDE_REGEXES[@]+"${EXCLUDE_REGEXES[@]}"}") || true; } \
+  | tr -cd '\0' | wc -c; exit "${PIPESTATUS[0]}")" || FIND_RC=$?
+echo "[${START_STAMP}] Files in scope (approx.): ${FILE_COUNT}" >> "${LOG_FILE}"
 if [[ "${FIND_RC}" -ne 0 ]]; then
   echo "[${START_STAMP}] Traversal incomplete: find exit ${FIND_RC} (unreadable or vanished paths); the count is a minimum" >> "${LOG_FILE}"
 fi
@@ -555,12 +578,7 @@ APT_AUTO
   mkdir -p /etc/clamav /etc/systemd/system/clamav-clamonacc.service.d /etc/systemd/system/clamav-freshclam.service.d \
     /var/lib/clamav/quarantine /var/log/clamav
 
-  # ExcludePath (clamdscan applies it while walking the tree for the daily scan):
-  #  ^/(proc|sys|dev)/   pseudo filesystems, nothing to scan
-  #  /node_modules/      registry packages, very many small files; check the supply chain with npm audit
-  #  /.cache/            regenerable caches (pip, npm, browsers); downloads land in ~/Downloads, which is scanned
-  #  /.git/objects/      zlib-packed history; the checked-out working tree is scanned
-  #  containers, docker  image layers; scan container images with an image scanner instead
+  # ExcludePath lines come from DAILY_EXCLUDES (reasons listed there).
   write_file /etc/clamav/clamd.conf 0644 root:root <<CLAMD
 # Managed by setup-clamav-ubuntu.sh
 LocalSocket /var/run/clamav/clamd.ctl
@@ -647,12 +665,7 @@ LogFileMaxSize 0
 Bytecode true
 BytecodeSecurity TrustSigned
 BytecodeTimeout 60000
-ExcludePath ^/(proc|sys|dev)/
-ExcludePath /node_modules/
-ExcludePath /\.cache/
-ExcludePath /\.git/objects/
-ExcludePath /\.local/share/containers/
-ExcludePath ^/var/lib/docker/
+${CLAMD_EXCLUDES}
 OnAccessMaxFileSize 25M
 OnAccessMaxThreads ${ONACCESS_MAX_THREADS}
 # clamd and root-owned system processes (package manager, backups, the daily scan) do not trigger

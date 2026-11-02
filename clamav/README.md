@@ -22,8 +22,8 @@ It supports desktop Ubuntu and headless Ubuntu hosts. On desktops it protects th
 ## Install or repair
 
 ```bash
-sudo bash clamav/setup-clamav-ubuntu.sh                              # the invoking user
-sudo bash clamav/setup-clamav-ubuntu.sh --user alice --user bob      # several users
+sudo bash clamav/setup-clamav-ubuntu.sh                              # only the invoking (sudo) user
+sudo bash clamav/setup-clamav-ubuntu.sh --user alice --user bob      # several users; name all of them on every run
 sudo bash clamav/setup-clamav-ubuntu.sh --verify                     # no config changes; still runs self-tests and a scan
 sudo bash clamav/setup-clamav-ubuntu.sh --skip-full-scan             # skip the real scan at the end
 bash clamav/setup-clamav-ubuntu.sh --help                            # all options
@@ -38,7 +38,7 @@ Other options: `--scan-path PATH` and `--watch-path PATH` (repeatable, replace t
 | On access (`clamonacc`) | `~/Desktop`, `~/Downloads`, `~/Documents` (always; created if missing) and `~/Public` of every `--user`, and `/tmp` |
 | Daily scan (`clamdscan --multiscan --fdpass`) | The whole home of every `--user` |
 
-**Exclusions** (`ExcludePath` in `clamd.conf`, applied by the daily scan), each with its reason:
+**Exclusions** (one list, `DAILY_EXCLUDES` in the installer: written as `ExcludePath` to `clamd.conf` and used for the daily scan's file count, so both agree; regexes are anchored to a home where they target app data), each with its reason:
 
 | Excluded | Why |
 |---|---|
@@ -47,6 +47,9 @@ Other options: `--scan-path PATH` and `--watch-path PATH` (repeatable, replace t
 | `/.cache/` | Regenerable caches (pip, npm, browsers); real downloads land in `~/Downloads`, which is watched and scanned. |
 | `/.git/objects/` | Packed history; the checked-out working tree is scanned. |
 | `/.local/share/containers/`, `/var/lib/docker/` | Container image layers; scan images with an image scanner instead. |
+| `~/.docker/desktop/vms/` | Docker Desktop VM disk images (very large; the guest filesystems are not inspected) and vsock socket endpoints. |
+| `~/.config/Code/CachedExtensionVSIXs/ms-python.*` | Cached packages of the `ms-python` VS Code extensions; their bundled binaries are reported as `Heuristics.Broken.Executable` (false positives from the `AlertBrokenExecutables` heuristic, not a signature match). Other extensions are still scanned, and `AlertBrokenExecutables` stays on everywhere else. |
+| `*.sock` directly in `~/.config/herdr/`, `~/.local/share/zed/`, `~/.codex/ipc/`, `~/.docker/desktop/` | Unix sockets of these apps; sockets are special files, not regular files, and `clamd` cannot scan them ("Not supported file type" errors). Any other `*.sock` file is scanned. |
 
 **Prevention mode is off by default.** `OnAccessPrevention` is a single global switch for all watched paths: with it on, every open in `~/Desktop` or `~/Documents` waits for a scan, which slows git, builds and IDEs. Detected files are still logged and moved to the quarantine. Use `--prevention` on hosts where blocking is worth the delay.
 
