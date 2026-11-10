@@ -8,6 +8,10 @@ This repository contains practical Ubuntu-focused security setup material, start
   Public guide for installing, configuring, and verifying ClamAV on Ubuntu
 - `clamav/setup-clamav-ubuntu.sh`
   Standalone installer script for setting up the ClamAV configuration described in the guide
+- `ubuntu-rdp/README.md`
+  Public guide for installing, configuring, and verifying xrdp on Ubuntu (22.04, 24.04, 26.04)
+- `ubuntu-rdp/ubuntu-rdp.sh`
+  Standalone installer/repair script: one retained RDP desktop, reattach on reconnect, Xfce fallback where GNOME has no X11 session
 
 ## ClamAV
 
