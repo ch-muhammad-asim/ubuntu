@@ -128,7 +128,7 @@ first one:
 8. **Live desktops** — desktop count within the limit, and no X server left behind without a tracked session
 9. **Polkit** — colord rules in place
 10. **Connection** — TCP handshake to localhost:3389
-11. **Logs** — no recent errors in journald
+11. **Logs** — no recent errors in journald (the connection probe's own handshake-failure lines are filtered out)
 
 ## Troubleshooting
 
