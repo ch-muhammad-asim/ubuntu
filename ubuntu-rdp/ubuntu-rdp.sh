@@ -252,6 +252,13 @@ ensure_desktop() {
     pass "Xfce installed"
 }
 
+# The TCP probe in this script connects to 3389 and hangs up without an RDP
+# handshake, so xrdp logs a failed negotiation for it on every run. Those lines
+# are caused by the check itself and are not setup errors.
+filter_rdp_log_noise() {
+    grep -vE 'xrdp_(sec|rdp)_incoming: xrdp_(iso|sec)_incoming failed|xrdp_process_main_loop: libxrdp_process_incoming failed|xrdp_iso_send: trans_write_copy_s failed|Sending \[ITU T\.125\] DisconnectProviderUltimatum failed' || true
+}
+
 # --- RDP desktop helpers --------------------------------------------------
 rdp_session_count() {
     local sessions session service count=0
@@ -569,7 +576,7 @@ do_verify() {
     # 11. Recent logs
     header "8. Recent Logs"
     local LOG_ERRORS
-    LOG_ERRORS=$(journalctl -u xrdp -u xrdp-sesman --since "10 min ago" --no-pager -p err 2>/dev/null | grep -v "^--" | tail -5 || true)
+    LOG_ERRORS=$(journalctl -u xrdp -u xrdp-sesman --since "10 min ago" --no-pager -p err 2>/dev/null | grep -v "^--" | filter_rdp_log_noise | tail -5 || true)
     if [[ -z "$LOG_ERRORS" ]]; then
         pass "No recent errors in xrdp logs"
     else

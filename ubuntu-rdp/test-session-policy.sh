@@ -121,6 +121,15 @@ is_positive_integer 0 && die 'is_positive_integer accepted 0'
 is_positive_integer '' && die 'is_positive_integer accepted empty'
 is_positive_integer 2x && die 'is_positive_integer accepted 2x'
 
+# The connection probe's own handshake failures must not look like setup errors.
+printf '%s\n' \
+    'Nov 10 11:35:06 host xrdp[1]: [ERROR] xrdp_sec_incoming: xrdp_iso_incoming failed' \
+    'Nov 10 11:35:06 host xrdp[1]: [ERROR] xrdp_rdp_incoming: xrdp_sec_incoming failed' \
+    'real error: something else broke' > "$testdir/journal.log"
+filtered=$(filter_rdp_log_noise < "$testdir/journal.log")
+[[ "$filtered" == 'real error: something else broke' ]] || die 'probe noise not filtered'
+: | filter_rdp_log_noise > /dev/null || die 'empty log must not fail the filter'
+
 # --- Verification must report every failed check, not exit on the first one --
 export RDP_TEST_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/ubuntu-rdp.sh"
 if bash -c '
